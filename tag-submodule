@@ -249,18 +249,18 @@ sub main{
       # hash unequal  --rename, --skip  ->  rename
       if($skip_existing && !$rename_existing){
         if($equal_hash){
-          info("* Skipping tag '$c_sm_tag' in submodule '$c_name' - already exists with same hash '$sm_hash'");
+          info("* Skipping tag in submodule '$c_name' - already exists with same hash '$sm_hash'");
           next;
         }else{
-          push(@errors, "Tag '$c_sm_tag' already exists in submodule '$c_name' with different hash '$existing_hash' than the tag in the superproject");
+          push(@errors, "Tag already exists in submodule '$c_name' with different hash '$existing_hash' than the tag in the superproject");
           next
         }
       }elsif(!$skip_existing && $rename_existing){
         # Will rename the tag below, no action needed here
-        
+
       }elsif($skip_existing && $rename_existing){
         if($equal_hash){
-          info("* Skipping tag '$c_sm_tag' in submodule '$c_name' - already exists with same hash '$sm_hash'");
+          info("* Skipping tag in submodule '$c_name' - already exists with same hash '$sm_hash'");
           next;
         }else{
           # Will rename the tag below, no action needed here
@@ -279,13 +279,13 @@ sub main{
           my $h = get_tag_hash("${c_sm_tag}_$suf", $c_path);
           if($h eq $sm_hash){ 
             # There is already a renamed tag with our hash
-            info("* Skipping tag '$sm_tag_name' in submodule '$c_name' - already exists as '${c_sm_tag}_$suf' with same hash '$sm_hash'");
+            info("* Skipping tag in submodule '$c_name' - already exists as '${c_sm_tag}_$suf' with same hash '$sm_hash'");
             next TAGLOOP; # skip tagging for this submodule
           }
           $suf++; # try next suffix
         }
         $c_sm_tag = $sm_tags[$i] = "${c_sm_tag}_${suf}";
-        info("* Renaming tag '$sm_tag_name' to '$c_sm_tag' in submodule '$c_name' as it already exists");
+        info("* Renaming tag to '$c_sm_tag' in submodule '$c_name' as it already exists");
       }
     }
 
@@ -335,6 +335,10 @@ sub main{
     my $n = $sm_names[$i];
     my $t = $sm_tags[$i];
     my $hash = $sm_commits{$n};
+
+    # If we are skipping this tag, it has no entry in %sm_commits
+    if(! defined $hash){ next; }
+    
     my @tag_cmd = ("git", "-C", $p, "tag", @tag_cmd);
     # Add tag message if the given tag is annotated
     push @tag_cmd, ("-m", $tag_content) if defined $tag_content;
