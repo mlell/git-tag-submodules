@@ -194,7 +194,9 @@ sub main{
     }else{
       # The repository is absorbed. Make a consistency check. In this case, it should not have
       # a normal git dir in the worktree
-      if( -d "$dirnow/.git" ){
+      # It's no problem if the submodule .git dir is a symlink into the superproject's .git/modules
+      # directory, as it is done e.g. by git annex
+      if( -d "$dirnow/.git" && ! -l "$dirnow/.git" ){
         push(@errors, "* Submodule '$name' is in $dirnow and in .git/modules/$name -- \n  we should not have two copies of this repo!");
         next;
       }
