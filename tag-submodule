@@ -257,9 +257,11 @@ sub main{
         }
       }elsif(!$skip_existing && $rename_existing){
         # Will rename the tag below, no action needed here
+        
       }elsif($skip_existing && $rename_existing){
         if($equal_hash){
           info("* Skipping tag '$c_sm_tag' in submodule '$c_name' - already exists with same hash '$sm_hash'");
+          next;
         }else{
           # Will rename the tag below, no action needed here
         }
