@@ -8,46 +8,22 @@ thisdir="$(realpath "$(dirname "${BASH_SOURCE[0]}")")"
 cd "$thisdir"
 export PATH="$(readlink -f "${thisdir}/.."):${PATH}"
 
-#Set up test repository
-bash create_repos01.sh
-
 # Usage: assert "Test message" [ "$(command)" = "expected output" ]
 # ... or any other bash command instead of [ ... ] that returns an exit code
 # of zero on success and non-zero on failure
 assert(){
     testmsg="$1"
     shift
-    if $@; then
+    if "$@"; then
       echo -n "."
     else
       printf "\n+++ TEST FAILED +++ %s" "$testmsg"
       return 1
     fi
 }
-# Set names and dates for annotated tags
-export GIT_AUTHOR_NAME="Test User"
-export GIT_AUTHOR_EMAIL="test@example.com"
-export GIT_COMMITTER_NAME="Test User"
-export GIT_COMMITTER_EMAIL="test@example.com"
-export GIT_AUTHOR_DATE="1970-01-01 00:00:00 +0000"
-export GIT_COMMITTER_DATE="1970-01-01 00:00:00 +0000"
 
-# create gpg key to sign tag
-mkdir gpg
-export GNUPGHOME=$(pwd)/gpg
-# Prepare a gpg test key based on a batch config
-cat >"$GNUPGHOME/gen-key.conf" <<'EOF'
-%no-protection
-Key-Type: RSA
-Key-Length: 2048
-Subkey-Type: RSA
-Subkey-Length: 2048
-Name-Real: Test User
-Name-Email: test@example.com
-Expire-Date: 1d
-%commit
-EOF
-gpg --batch --gen-key "$GNUPGHOME/gen-key.conf"
+
+
 
 cd parent01 
 
@@ -55,36 +31,29 @@ cd parent01
 git tag tag_lw
 git tag -a -m "Annotated tag" tag_ann
 git tag -s -m "Signed tag" tag_sgn
-git tag tag_lw2
+git tag -m "Signed tag" tag_sgn2
+
+# Use the pattern 'if [ "x$(<command>)" = "x<result>" ]' to avoid a bash error about an 
+# unary operator if one of ... is empty
 
 # Test that lightweight tag is copied
 tag-submodule tag_lw
-assert "Can copy lightweight tag" [ "$(git -C child cat-file -t tag_lw)" = "commit" ]
+assert "Can copy lightweight tag" [ "x$(git -C child cat-file -t tag_lw)" = "xcommit" ]
 
 # Test that annotated tag is copied
 tag-submodule tag_ann
-assert "Can copy annotated tag" [ "$(git -C child cat-file -t tag_ann)" = "tag" ]
+assert "Can copy annotated tag" [ "x$(git -C child cat-file -t tag_ann)" = "xtag" ]
 
 
 # Test that signed tag is copied
 tag-submodule tag_sgn
-assert "Can copy signed tag" [ "$(git -C child cat-file -t tag_sgn)" = "tag" ]
-assert "Strips signature" [ "$(git -C child cat-file -p tag_sgn | grep -- "-----BEGIN PGP SIGNATURE-----")" = "" ]
+assert "Can copy signed tag" [ "x$(git -C child cat-file -t tag_sgn)" = "xtag" ]
+assert "Strips signature" [ "x$(git -C child cat-file -p tag_sgn | grep -- "-----BEGIN PGP SIGNATURE-----")" = "x" ]
 
 # Test signing of copied tags
-tag-submodule -s tag_lw2
-assert "Tag signing works" [ "$(git -C child cat-file -p tag_lw2 | grep -- "-----BEGIN PGP SIGNATURE-----")" != "" ]
+tag-submodule -s tag_sgn2
+assert "Tag signing works" [ ! "x$(git -C child cat-file -p tag_sgn2 | grep -- "-----BEGIN PGP SIGNATURE-----")" = "x" ]
 
-
-# Deinit the child submodule
-git submodule deinit child
-git tag tag_lw_for_a_opt
-
-if tag-submodule -a tag_lw_for_a_opt 2>&1 | grep -q "'child' is not initialized, skipping" ; then
-  assert "Deinited submodule skipped" true
-else
-  assert "Deinited submodule skipped" false
-fi
 
 # Tear down
 cd "$thisdir"

@@ -3,8 +3,13 @@
 use strict;
 use warnings;
 use File::Spec;
+use File::Temp;
 use Cwd ("abs_path", "getcwd");
 use List::Util 'any';
+#use Test2::V0;
+use IPC::Open3;
+use Symbol 'gensym'; # need to manually generate an error file handle for open3
+
 
 my $INFO = 1; # whether to print status output
 
@@ -13,23 +18,26 @@ sub usage {
   Usage: tag-submodule [OPTIONS] [--] tag-name [PATH...]
   
   OPTIONS:
-    -a      Copy tag to active submodules only. Without this option,
-            encountering a submodule that is not active will cause an error.
     
-    -s, -u <keyid>
-            Sign tags with the default GPG key (-s) or the specified key (-u).
-            Uses the options of the same name in "git tag".
-
     -f      Overwrite existing tags in submodules. Use "git tag -f".
     
     -h, --help
             Display this usage information
+    
+    -n      Dry run; Print which submodules and commits therein would get tagged
+            without actually tagging them.
+
+    -s, -u <keyid>
+            Sign tags with the default GPG key (-s) or the specified key (-u).
+            Uses the options of the same name in "git tag".
 
     -q, --quiet
             Do not print status messages
   
     --      Declare end of option arguments, remaining arguments are treated
             as positional (e.g. use if the tag name starts with dashes)
+
+    --test  Run unit tests
 
   POSITIONAL ARGUMENTS:
     tag-name
@@ -54,11 +62,10 @@ exit;
 
 sub main{
 
-  my $commit = "HEAD"; # commit to look up submodule versions for
   my $tag; # tag name to use for the submodule commits
   my $sign;  # undef = don't sign, "" = git tag -s, "<keyid>" = git tag -u <keyid>
   my $force = 0; # if =1, call git tag -f, this overwrites existing tasks
-  my $active = 0; # if =1, only copy to active submodules
+  my $dry_run = 0; # if =1, only print which commits would get tagged
 
   while (@ARGV) {
     my $arg = shift @ARGV;
@@ -74,16 +81,19 @@ sub main{
     if($arg eq '-h' || $arg eq '--help'){
       usage();
       exit 0;
-    }elsif($arg eq '-a'){
-      $active = 1;
     }elsif($arg eq '-f'){
       $force = 1;
+    }elsif ($arg eq '-n'){
+      $dry_run = 1;
     }elsif ($arg eq '-s'){
       $sign = "";
     }elsif ($arg eq '-u'){
       $sign = shift @ARGV;
     }elsif ($arg eq '-q'){
       $INFO = 0;
+    }elsif ($arg eq '--test'){
+      test();
+      exit 0;
     }else{
       error("Unknown option: $arg, use --help");
     };
@@ -104,6 +114,10 @@ sub main{
   if(git_status( "show-ref", "--verify", "--quiet", "refs/tags/$tag") != 0){
     error("Tag '$tag' does not exist");
   }
+  my $tag_hash = git_output("rev-parse", "refs/tags/$tag");
+  # Can only tag nested submodules if chosen tag belongs to currently 
+  # checked out version
+  my $head_hash = git_output("rev-parse", "HEAD");
 
   # If it is an annotated tag, save the content. Otherwise $tag_content
   # remains undefined.
@@ -131,15 +145,23 @@ sub main{
   }
   chdir $workdir;
 
-  # Error out early if the user has given an git revision that is unknown, e.g.
-  # if they gave an invalid tag or branch name with the -c option
-  if(git_status("cat-file", "-e", $commit) != 0){
-    error("Given rev '$commit' does not lead to a known commit");
-  }
 
-  # Submodule paths (inside brackets in .gitmodule) that are subdirectories 
-  # of any element in @paths
-  my @sm_paths = filter_submodule_paths(@paths);
+  # Get list of submodules from the tag's commit
+  my @x  = list_submodules($tag_hash);
+  my @sm_names = @{$x[0]};
+  my @sm_paths = @{$x[1]};
+
+  # Submodule paths that are subdirectories of any element in @paths
+  my @keep = map { is_subdirectory_of_any($_, \@paths) } @sm_paths;
+  # get indices where return value is 1
+  @keep = grep { $keep[$_] } 0..$#keep;
+  @sm_paths = @sm_paths[@keep];  # submodules paths in .gitmodules
+  @sm_names = @sm_names[@keep];  # submodule names in .gitmodules
+  my @sm_repos = map { ".git/modules/$_" } @sm_names;  # git dirs of submodules if absorbed into .git/modules
+
+  # for git tag command (changes depending on whether the module is absorbed)
+  my @sm_tagdir = (@sm_repos);
+  
   
   # Pre-check:
   # Error if one of the submodules is not initialized or the tag already exists
@@ -147,29 +169,47 @@ sub main{
   my @errors = ();
   # Initialize mapping of submodule paths to submodule commits
   my %sm_commits = ();
-  for (my $i = 0; $i < @sm_paths; $i++ ){
-    my $dir = $sm_paths[$i];
-    # Check if submodule is active
-    my $root = git_output("-C", $dir, "rev-parse", "--show-toplevel");
-    if( not is_path_same($root, $dir) ){
-      if( !$active){
-        push @errors, "* Submodule is not initialized: '$dir'";
+  for (my $i = 0; $i < @sm_names; $i++ ){
+    my $name = $sm_names[$i];
+    my $repo = $sm_repos[$i];  
+    my $dir = $sm_paths[$i];   
+    my $tagdir = $sm_tagdir[$i]; 
+
+    # If the repo does not exist, the git module is nested and not absorbed
+    # It might exist in the currently checked out working dir, otherwise,
+    # it must be initialized and checked out first
+
+    # Where the submodule is now (can be empty if submodule does not exist in this version)
+    my $dirnow = git_config_from_commit("HEAD:.gitmodules", "--get", "submodule.$name.path");
+
+    if(! -d $repo){
+      # The module is not absorbed. So therefore it must be in the worktree
+      if( -d $dirnow && is_git_root($dirnow)){
+        $tagdir = $dirnow;
+        $sm_tagdir[$i] = $dirnow;
       }else{
-        # If -a is given: Just skip this submodule without error
-        info("Submodule '$dir' is not initialized, skipping");
+        push(@errors, "* Submodule '$name' (in $dirnow) is not initialized and not in .git/modules.\n  Use git submodules update --init");
+        next;
       }
-      next;
+    }else{
+      # The repository is absorbed. Make a consistency check. In this case, it should not have
+      # a normal git dir in the worktree
+      if( -d "$dirnow/.git" ){
+        push(@errors, "* Submodule '$name' is in $dirnow and in .git/modules/$name -- \n  we should not have two copies of this repo!");
+        next;
+      }
     }
-    if( !$force && git_tag_exists($dir, $tag )){
-      push @errors, "* Tag '$tag' already exists in submodule '$dir'";
+    
+    if( !$force && git_tag_exists($tagdir, $tag )){
+      push(@errors, "* Tag '$tag' already exists in submodule '$name' (folder $dir)");
       next;
     }
     # Commit that will get the tag in the submodule
-    $sm_commits{$dir} = saved_submodule_commit($dir, $commit);
+    $sm_commits{$name} = saved_submodule_commit($dir, $tag_hash);
   }
   if (@errors){ error("Errors happened:\n", join("\n", @errors), "\n"); }
 
-  # No fail, then set the tags
+  # No fail (@errors empty), then set the tags
   my @tag_cmd;
   # if $sign is undefined, use -a if $tag_content is defined, else lightweight tag
   # if $sign is "", use -s, if $sign has content, use -u
@@ -179,10 +219,15 @@ sub main{
     }else{
       # lightweight tag, no additional arguments
     }
-  }elsif($sign eq ""){
-    push @tag_cmd, "-s";
   }else{
-    push @tag_cmd, "-u", $sign;
+    if(! defined $tag_content){
+      error("Cannot sign tag $tag, as it is a lightweight tag");
+    }
+    if($sign eq ""){
+      push @tag_cmd, "-s";
+    }else{
+      push @tag_cmd, "-u", $sign;
+    }
   }
   logx("Tag command: git tag @tag_cmd");
   
@@ -194,18 +239,18 @@ sub main{
 
   info("Created tag '$tag' in submodules:");
   # for each key in sm_commits
-  for (my $i = 0; $i < @sm_paths; $i++ ){
-    # skip if there is no key for this path, e.g. if submodule is not 
-    # active and -a is given
-    next if ! exists $sm_commits{$sm_paths[$i]};
-
-    my $p = $sm_paths[$i];
-    my $hash = $sm_commits{$p};
-    my @tag_cmd = ("git", "-C", $p, "tag");
+  for (my $i = 0; $i < @sm_names; $i++ ){
+    
+    my $p = $sm_tagdir[$i];
+    my $r = $sm_repos[$i];
+    my $n = $sm_names[$i];
+    my $hash = $sm_commits{$n};
+    my @tag_cmd = ("git", "-C", $p, "tag", @tag_cmd);
     # Add tag message if the given tag is annotated
     push @tag_cmd, ("-m", $tag_content) if defined $tag_content;
     push @tag_cmd, ($tag, $hash);
-    system(@tag_cmd);
+    
+    if (!$dry_run){ system(@tag_cmd); }
     
     info("$p ($hash)");
 
@@ -221,11 +266,14 @@ sub main{
 sub readpipex {
   no warnings 'exec';
   open my $stdout, '-|', @_ or die "readpipex '$_[0]' failed: $!";
+
   my @output = wantarray ? readline($stdout)
     : do { local $/; scalar readline $stdout };
   close $stdout; 
   return wantarray ? @output : $output[0]
 }
+
+
 
 # Set the working directory to each of the given folders and execute 
 # a command
@@ -260,10 +308,18 @@ sub execute_command_foreach{
 # Function to run Git commands and capture output
 sub git_output {
   my @command = @_;
+
   logx("GIT: @command");
-  my $output = readpipex("git", @command);
+
+  my ($output, $error, $exit_code) = cmd_communicate(["git", @command]);
+  print STDERR $error if $error;
+  # Check for errors
+  if ($exit_code != 0) {
+    die("git @command failed with code $exit_code\n");
+  }
+
   $output =~ s/\s+$//;
-  logx("OUTPUT: $output\n");
+  logx("OUTPUT: '$output'\n");
   return $output;
 }
 
@@ -279,8 +335,7 @@ sub git_status {
 # Return true iff the given tag exists in the given repository
 sub git_tag_exists {
   my ($repo, $tag) = @_;
-  my $root = git_output("-C", $repo, "rev-parse", "--show-toplevel");
-  if( not is_path_same($root, $repo) ){
+  if( not is_git_root($repo) ){
     die("git_tag_exists: $repo is not a submodule")
   }
   git_status("-C", $repo, "show-ref", "--tags", $tag, "--quiet");
@@ -299,15 +354,69 @@ sub list_active_submodules{
   return @list
 }
 
+# Check out a git configuration file from the given blob refspec
+# Required arguments: 1: Blob refspec, for example "HEAD:.gitmodules"
+# Further arguments are forwarded to git config
+sub git_config_from_commit{
+  my $blob = shift;
+  my @args = @_;
+
+
+  # Read content of blob using cat-file
+  my $content = git_output("cat-file", "blob", $blob);
+  
+  # output of "git config -f <(git cat-file blob <blob>) --get <args>"
+  #my $ret = qx{ git config -f <(git cat-file blob $blob) @args };
+  my ($ret, $err, $code) = cmd_communicate(["git", "config", "-f", "-", @args], $content);
+  ## Check out the config file and write it into a temporary file
+  #my $temp = File::Temp->new(UNLINK => 1);
+  #my $gitmodules = git_output("cat-file", "blob", "$blob");
+  #print $temp $gitmodules;
+  #$temp->flush;
+  if ($code != 0 && $err eq ""){
+    # Key empty
+    return "";
+  }elsif($code != 0){
+    die("git_config_from_commit: git config failed:\n$err\n");
+  }
+  # Split off trailing whitespace/newline
+  $ret =~ s/\s*$//s;
+
+  #my $ret = git_output("config", "-f", $temp->filename, @args);
+  return $ret;
+}
+
+# List the submodules that are registered in the given commit
+# Required argument: Commit Hash
 sub list_submodules {
-  my $ret = git_output("config", "-f", ".gitmodules", "--get-regexp", ".*path");
+  my $commit_hash = shift;
+
+  # We need the .gitmodules content at the time of that commit
+  # write it into a temporary file and give it to git config
+  my $ret = git_config_from_commit(
+    "$commit_hash:.gitmodules", 
+    "--get-regexp", "--name-only", q{^submodule\..*\.path$}
+  );
+
   my @list = split /\n/, $ret;
-  @list = map { s/.*? //; $_ } @list; # Split off submodule name, leave path only
+
+  # remove prefix and suffix = substring region [10 ; length-4]
+  # (prefix = submodule. , suffix = .path => 10 and 5 chars, respectively)
+  @list = map { substr($_, 10, length($_) - 10 - 5) } @list;
+  
+  # Get the path of each submodule from the .gitmodules file
+  # (submodule name and path can be different)
+  my @sm_paths = map { 
+    #git_output( "config", "-f", $temp->filename, "--get", "submodule.$_.path")
+    git_config_from_commit("$commit_hash:.gitmodules", "--get", "submodule.$_.path")
+  } @list;
+
   logx("list_submodules:");
   logx($_) for @list;
   logx("");
-  return @list
+  return ( \@list, \@sm_paths);
 }
+
 # List all files in the current tree and print those that are of
 # type 'commit', meaning submodules and nested repos
 sub find_nested_repositories {
@@ -322,32 +431,47 @@ sub find_nested_repositories {
   return @paths;
 }
 
+# Return boolean, whether the given path is the root directory of a
+# git repo (worktree or bare/module gitdir)
+# Arguments: 1: Path to check
+sub is_git_root{
+  my $path = shift;
+  my $inwt = git_output("-C", $path, "rev-parse", "--is-inside-work-tree");
+  if( $inwt eq "true"){
+    return git_output("-C", $path, "rev-parse", "--show-prefix") eq "";
+  }elsif( $inwt eq "false"){
+    return git_output("-C", $path, "rev-parse", "--git-dir") eq ".";
+  }else{
+    die("git --is-inside-work-tree errored; are we inside a git repository?")
+  }
+}
+
 # Return submodule paths that are below any of the given paths
 # Note that the paths MUST be relative!
-sub filter_submodule_paths {
-  my @paths = @_;
+# Arguments: 1: A path
+#            2: List of paths to check whether arg 1 is within it
+# Returns 0 (false) or 1 (true)
+sub is_subdirectory_of_any {
+  my $sm_path = $_[0];
+  my @paths = @{$_[1]};
 
-  # Submodule names (inside brackets in .gitmodule)
-  my @sm_paths = list_submodules();
-  # Turn into submodule paths
-  @sm_paths = uniq(@sm_paths);
 
   # If any element of $path is "" or ".", we return all paths
   # This saves us from keeping them in mind in the rest of the function
   # even though its clear that these paths include all submodules
   if(any { $_ eq "" or $_ eq "." } @paths){
-    return @sm_paths;
+    return 1;
   }
 
   # Resolve duplicate path separators and ./ (does not tackle
   # ../ components for portability)
   @paths = map {  File::Spec->canonpath($_) } @paths;
-  @sm_paths = map {  File::Spec->canonpath($_) } @sm_paths;
+  $sm_path = File::Spec->canonpath($sm_path);
 
  
   # Make sure paths end with a slash to only match complete folder names
   @paths = map { s,/*$,/,r } @paths;
-  @sm_paths = map { s,/*$,/,r } @sm_paths;
+  $sm_path =~ s,/*$,/, ;
 
   # We can't modify submodules that are not active, notify the user.
   #my @inactive = grep { ! -e "$_/.git" } @sm_paths;
@@ -355,21 +479,14 @@ sub filter_submodule_paths {
 
   #logx("Skipping inactive submodules:\n" . join("", (map {"* $_\n"} @inactive))) if @inactive;
   
-  # For each submodule path, check if it starts with any element of @paths 
-  @sm_paths = grep {
-    my $sm = $_;
-    logx("submodule '$sm'");
-    any {
-      my $x = index($sm, $_ ) == 0; # index 0 => starts with this
-      print("index($sm, $_) == ",$x?1:0,"\n");
-      $x
-    } @paths;
-  } @sm_paths;  
-
-  print "@sm_paths\n";
-  @sm_paths = uniq(@sm_paths);
-
-  return @sm_paths;
+  # Check if $sm_path starts with any element of @paths 
+  
+  return any {
+    my $x = index($sm_path, $_ ) == 0; # index 0 => starts with this
+    print("index($sm_path, $_) == ",$x?1:0,"\n");
+    $x
+  } @paths;
+  
 }
 
 sub get_submodule_property{
@@ -456,5 +573,104 @@ sub info{
   }
 }
 
-main;
+# Open a command and return STDOUT and STDERR. 
+# Optionally, provide a string to send to STDIN.
+# The program is called without a shell.
+# This function is a robuster alternative to system() with bash process
+# subsitution as there is no risk of shell injection (b/c there is no shell)
+# Argument 1: List-ref with the command and options as individual elements
+# Argument 2: String with STDIN content (optional)
+# Returns: Tuple of (stdout (string), stderr (string), exit code(int))
+sub cmd_communicate {
+  my ($cmd_ref, $stdin_data) = @_;
+  my @command = @$cmd_ref;
+  if(! defined $stdin_data){
+    $stdin_data = "";
+  }
+  # Open process with three filehandles
+  # Need to create $err symbol manually, see open3 docs.
+  my $pid = open3(my $in, my $out, my $err = gensym, @command) or die "Failed to execute @command: $!";
+  
+  # Set up for non-blocking reads/writes
+  my $output = '';
+  my $error = '';
+  my $stdin_pos = 0;  # Position in stdin data
+  my $stdin_len = defined($stdin_data) ? length($stdin_data) : 0;
+  
+  # Create bit vectors for select
+  my $rin = '';
+  my $win = '';
+  vec($rin, fileno($out), 1) = 1;  # Read from stdout
+  vec($rin, fileno($err), 1) = 1;  # Read from stderr
+  
+  # Set up write vector if we have stdin data
+  if ($stdin_len > 0) {
+    vec($win, fileno($in), 1) = 1;  # Write to stdin
+  }
+  
+  # Keep reading/writing until both streams are done and there
+  # is no more stdin data
+  my ($rout, $wout);
+  while (select($rout = $rin, $wout = $win, undef, undef)) {
+    # Check if stdout is ready
+    if (vec($rout, fileno($out), 1)) {
+      my $line = <$out>;
+      if (defined $line) {
+        $output .= $line;
+      } else {
+        # EOF on stdout
+        vec($rin, fileno($out), 1) = 0;
+      }
+    }
+    
+    # Check if stderr is ready
+    if (vec($rout, fileno($err), 1)) {
+      my $line = <$err>;
+      if (defined $line) {
+        $error .= $line;
+      } else {
+        # EOF on stderr
+        vec($rin, fileno($err), 1) = 0;
+      }
+    }
+    
+    # Write to stdin if it's ready and we have data left
+    if ( defined(fileno($in)) && $stdin_len > 0 && vec($wout, fileno($in), 1)) {
+      # Write a chunk of data (up to 4096 bytes at a time)
+      my $chunk_size = ($stdin_len - $stdin_pos) > 4096 ? 4096 : ($stdin_len - $stdin_pos);
+      my $bytes_written = syswrite($in, $stdin_data, $chunk_size, $stdin_pos);
+      
+      if (defined $bytes_written) {
+        $stdin_pos += $bytes_written;
+        
+        # If we've written all data, close stdin and stop selecting for writing
+        if ($stdin_pos >= $stdin_len) {
+          close($in);
+          $win = '';  # Clear write vector
+        }
+      }
+    }
+    
+    # Exit loop when both streams are done and we've written all stdin data
+    last if vec($rin, fileno($out), 1) == 0 && 
+             vec($rin, fileno($err), 1) == 0 &&
+             ($stdin_len == 0 || $stdin_pos >= $stdin_len);
+  }
+  
+  waitpid($pid, 0);
+  my $exit_code = $? >> 8;
 
+  return ($output, $error, $exit_code);
+}
+  
+  
+#sub test{
+#  # run all procedures that start with "test_"
+#  my @tests = grep { /^test_/ } keys %main::;
+#  no strict 'refs';
+#  for my $test (@tests){
+#    $test->();
+#  }
+#}
+
+main;
