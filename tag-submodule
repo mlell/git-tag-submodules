@@ -139,7 +139,7 @@ sub main{
   if(git_status( "show-ref", "--verify", "--quiet", "refs/tags/$tag") != 0){
     error("Tag '$tag' does not exist");
   }
-  my $tag_hash = git_output("rev-parse", "refs/tags/$tag");
+  my $tag_hash = get_tag_hash($tag);
   # Can only tag nested submodules if chosen tag belongs to currently 
   # checked out version
   my $head_hash = git_output("rev-parse", "HEAD");
@@ -238,8 +238,7 @@ sub main{
       }
       # Check if the existing tag in the submodule points to the same commit 
       # that we want to tag
-      my $existing_hash = git_output(
-        "-C", $c_tagdir, "rev-parse", "refs/tags/$c_sm_tag");
+      my $existing_hash = get_tag_hash($c_sm_tag, $c_tagdir);
       my $sm_hash = saved_submodule_commit($c_path, $tag_hash);
       my $equal_hash = $existing_hash eq $sm_hash;
       # hash equal,   --skip             -> skip
@@ -275,7 +274,7 @@ sub main{
         # Find an available tag name with suffix _N (N >= 2)
         my $suf = 2;
         while(git_tag_exists($c_path, "${c_sm_tag}_$suf")){
-          my $h = git_output("-C", $c_path, "rev-parse", "refs/tags/${c_sm_tag}_$suf");
+          my $h = get_tag_hash("${c_sm_tag}_$suf", $c_path);
           if($h eq $sm_hash){ 
             # There is already a renamed tag with our hash
             info("* Skipping tag '$sm_tag_name' in submodule '$c_name' - already exists as '${c_sm_tag}_$suf' with same hash '$sm_hash'");
@@ -447,6 +446,13 @@ sub list_active_submodules{
   # Remove prefix and suffix
   @list = map { s/submodule\.(.*)\.active true/$1/; $_ } @list;
   return @list
+}
+
+sub get_tag_hash{
+  my ($tag, $repo) = @_;
+  my @cmd = defined $repo ? ("-C", $repo) : ();
+  push @cmd, "rev-parse", "refs/tags/$tag^{}";  # ^{} dereferences annotated tags
+  return git_output(@cmd);
 }
 
 # Check out a git configuration file from the given blob refspec
