@@ -589,9 +589,7 @@ sub is_subdirectory_of_any {
   # Check if $sm_path starts with any element of @paths 
   
   return any {
-    my $x = index($sm_path, $_ ) == 0; # index 0 => starts with this
-    print("index($sm_path, $_) == ",$x?1:0,"\n");
-    $x
+    index($sm_path, $_ ) == 0; # index 0 => starts with this
   } @paths;
   
 }
