@@ -213,6 +213,10 @@ sub main{
 
   # No fail (@errors empty), then set the tags
   my @tag_cmd;
+
+  if( $force ){
+    push @tag_cmd, "-f";
+  }
   # if $sign is undefined, use -a if $tag_content is defined, else lightweight tag
   # if $sign is "", use -s, if $sign has content, use -u
   if(! defined $sign){
