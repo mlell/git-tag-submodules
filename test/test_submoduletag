@@ -6,6 +6,7 @@ set -ue -o pipefail
 
 thisdir="$(realpath "$(dirname "${BASH_SOURCE[0]}")")"
 cd "$thisdir"
+# Make sure tag-submodule is in PATH
 export PATH="$(readlink -f "${thisdir}/.."):${PATH}"
 
 # Usage: assert "Test message" [ "$(command)" = "expected output" ]
@@ -14,10 +15,11 @@ export PATH="$(readlink -f "${thisdir}/.."):${PATH}"
 assert(){
     testmsg="$1"
     shift
-    if "$@"; then
-      echo -n "."
+    # Read code to test from STDIN
+    if bash -u -e -o pipefail 2>&1; then
+      printf "TEST OK: %s\n" "$testmsg"
     else
-      printf "\n+++ TEST FAILED +++ %s" "$testmsg"
+      printf "\n+++ TEST FAILED +++ %s\n" "$testmsg"
       return 1
     fi
 }
@@ -38,22 +40,64 @@ git tag -m "Signed tag" tag_sgn2
 
 # Test that lightweight tag is copied
 tag-submodule tag_lw
-assert "Can copy lightweight tag" [ "x$(git -C child cat-file -t tag_lw)" = "xcommit" ]
+assert "Can copy lightweight tag" <<EOF
+  [ "x$(git -C child cat-file -t tag_lw)" = "xcommit" ]
+EOF
 
 # Test that annotated tag is copied
 tag-submodule tag_ann
-assert "Can copy annotated tag" [ "x$(git -C child cat-file -t tag_ann)" = "xtag" ]
+assert "Can copy annotated tag" <<EOF
+  [ "x$(git -C child cat-file -t tag_ann)" = "xtag" ]
+EOF
 
 
 # Test that signed tag is copied
 tag-submodule tag_sgn
-assert "Can copy signed tag" [ "x$(git -C child cat-file -t tag_sgn)" = "xtag" ]
-assert "Strips signature" [ "x$(git -C child cat-file -p tag_sgn | grep -- "-----BEGIN PGP SIGNATURE-----")" = "x" ]
+assert "Can copy signed tag" <<EOF
+  [ "x$(git -C child cat-file -t tag_sgn)" = "xtag" ]
+EOF
+
+assert "Strips signature" <<EOF 
+  [ "x$(git -C child cat-file -p tag_sgn | grep -- "-----BEGIN PGP SIGNATURE-----")" = "x" ]
+EOF
 
 # Test signing of copied tags
 tag-submodule -s tag_sgn2
-assert "Tag signing works" [ ! "x$(git -C child cat-file -p tag_sgn2 | grep -- "-----BEGIN PGP SIGNATURE-----")" = "x" ]
+assert "Tag signing works" <<EOF
+  [ ! "x$(git -C child cat-file -p tag_sgn2 | grep -- "-----BEGIN PGP SIGNATURE-----")" = "x" ]
+EOF
 
+# Test that the tag is skipped if user requests
+git -C child commit --allow-empty -m "One more commit to test skipping/renaming of tags"
+git add . && git commit -m "Update submodule"
+
+assert "--skip-existing skips if submodule tag hash is same" <<'EOF'
+  x="$(tag-submodule --skip-existing tag_lw 2>&1 || : )"
+  if [[ $x =~ "Skipping tag 'tag_lw'"  ]]; 
+  then exit 0; else printf "ERROR output:\n%s" "$x";exit 1; fi
+EOF
+
+git tag -f tag_lw  # move the lightweight tag to current commit to test ...
+# ... renaming/skipping of existing tags
+
+assert "--skip-existing fails if submodule tag hash is different" <<'EOF'
+  x="$(tag-submodule --skip-existing tag_lw 2>&1 || : )"
+  if [[ $x =~ "Tag 'tag_lw' already exists"  ]]; 
+  then exit 0; else printf "ERROR output:\n%s" "$x";exit 1; fi
+EOF
+
+# creates tag_lw_2 in child
+assert "--rename-existing renames tag if it exists already" <<'EOF'
+  x="$(tag-submodule --rename-existing tag_lw 2>&1 || : )"
+  if [[ $x =~ "Renaming tag 'tag_lw' to 'tag_lw_2'"  ]]; 
+  then exit 0; else printf "ERROR output:\n%s" "$x";exit 1; fi
+EOF
+
+assert "--rename-existing --skip-existing skips renamed tag if it exists already" <<'EOF'
+  x="$(tag-submodule --rename-existing tag_lw 2>&1 || : )"
+  if [[ $x =~ Skipping.*tag_lw.*already\ exists.*tag_lw_2  ]]; 
+  then exit 0; else printf "ERROR output:\n%s" "$x";exit 1; fi
+EOF
 
 # Tear down
 cd "$thisdir"

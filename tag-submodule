@@ -15,7 +15,7 @@ my $INFO = 1; # whether to print status output
 
 sub usage {
   print <<EOF;
-  Usage: tag-submodule [OPTIONS] [--] tag-name [PATH...]
+  Usage: tag-submodule [OPTIONS] [--] TAG_NAME [PATH...]
   
   OPTIONS:
     
@@ -33,11 +33,22 @@ sub usage {
 
     -q, --quiet
             Do not print status messages
+    
+    --as OTHER_TAG_NAME
+            Use this name for the new submodule tag instead of TAG_NAME.
   
+    --skip-existing
+            If a tag of the same name and the same hash exists already in the
+            submodule, skip it. If the hash differs, throw an error, except
+            if --rename-existing is also given, then rename, see help for that
+            option.
+
+    --rename-existing
+            If a tag with the same name exists already in the submodule,
+            suffix it with "_N" where N is an integer starting with 2
+
     --      Declare end of option arguments, remaining arguments are treated
             as positional (e.g. use if the tag name starts with dashes)
-
-    --test  Run unit tests
 
   POSITIONAL ARGUMENTS:
     tag-name
@@ -66,6 +77,9 @@ sub main{
   my $sign;  # undef = don't sign, "" = git tag -s, "<keyid>" = git tag -u <keyid>
   my $force = 0; # if =1, call git tag -f, this overwrites existing tasks
   my $dry_run = 0; # if =1, only print which commits would get tagged
+  my $sm_tag_name; # --as option
+  my $skip_existing = 0; # if =1, skip if tag exists with same hash
+  my $rename_existing = 0; # if =1, rename existing tags with suffix _N
 
   while (@ARGV) {
     my $arg = shift @ARGV;
@@ -91,6 +105,12 @@ sub main{
       $sign = shift @ARGV;
     }elsif ($arg eq '-q'){
       $INFO = 0;
+    }elsif ($arg eq '--as'){
+      $sm_tag_name = shift @ARGV;
+    }elsif ($arg eq '--skip-existing'){
+      $skip_existing = 1;
+    }elsif ($arg eq '--rename-existing'){
+      $rename_existing = 1;
     }elsif ($arg eq '--test'){
       test();
       exit 0;
@@ -98,9 +118,14 @@ sub main{
       error("Unknown option: $arg, use --help");
     };
   }
-
+  # -f and --skip-existing are mutually exclusive
+  if($force && ( $skip_existing || $rename_existing)){
+    error("-f and either of --skip-existing and --rename-existing are mutually exclusive");
+  }
+  
   if(! @ARGV){ error("Tag argument required, see --help") ; }
   $tag = shift @ARGV;
+  if( ! defined $sm_tag_name) { $sm_tag_name = $tag; }
   logx("Tag: $tag");
 
   my @paths = @ARGV;
@@ -158,7 +183,7 @@ sub main{
   @sm_paths = @sm_paths[@keep];  # submodules paths in .gitmodules
   @sm_names = @sm_names[@keep];  # submodule names in .gitmodules
   my @sm_repos = map { ".git/modules/$_" } @sm_names;  # git dirs of submodules if absorbed into .git/modules
-
+  my @sm_tags = map { "$sm_tag_name" } @sm_names; # if --rename-existing is set this can change for some submodules
   # for git tag command (changes depending on whether the module is absorbed)
   my @sm_tagdir = (@sm_repos);
   
@@ -169,26 +194,27 @@ sub main{
   my @errors = ();
   # Initialize mapping of submodule paths to submodule commits
   my %sm_commits = ();
-  for (my $i = 0; $i < @sm_names; $i++ ){
-    my $name = $sm_names[$i];
-    my $repo = $sm_repos[$i];  
-    my $dir = $sm_paths[$i];   
-    my $tagdir = $sm_tagdir[$i]; 
+  TAGLOOP:for (my $i = 0; $i < @sm_names; $i++ ){
+    my $c_name = $sm_names[$i];
+    my $c_repo = $sm_repos[$i];
+    my $c_path = $sm_paths[$i];
+    my $c_tagdir = $sm_tagdir[$i];
+    my $c_sm_tag = $sm_tags[$i];
 
     # If the repo does not exist, the git module is nested and not absorbed
     # It might exist in the currently checked out working dir, otherwise,
     # it must be initialized and checked out first
 
     # Where the submodule is now (can be empty if submodule does not exist in this version)
-    my $dirnow = git_config_from_commit("HEAD:.gitmodules", "--get", "submodule.$name.path");
+    my $pathnow = git_config_from_commit("HEAD:.gitmodules", "--get", "submodule.$c_name.path");
 
-    if(! -d $repo){
+    if(! -d $c_repo){
       # The module is not absorbed. So therefore it must be in the worktree
-      if( -d $dirnow && is_git_root($dirnow)){
-        $tagdir = $dirnow;
-        $sm_tagdir[$i] = $dirnow;
+      if( -d $pathnow && is_git_root($pathnow)){
+        $c_tagdir = $pathnow;
+        $sm_tagdir[$i] = $pathnow;
       }else{
-        push(@errors, "* Submodule '$name' (in $dirnow) is not initialized and not in .git/modules.\n  Use git submodules update --init");
+        push(@errors, "* Submodule '$c_name' (in $pathnow) is not initialized and not in .git/modules.\n  Use git submodules update --init");
         next;
       }
     }else{
@@ -196,18 +222,74 @@ sub main{
       # a normal git dir in the worktree
       # It's no problem if the submodule .git dir is a symlink into the superproject's .git/modules
       # directory, as it is done e.g. by git annex
-      if( -d "$dirnow/.git" && ! -l "$dirnow/.git" ){
-        push(@errors, "* Submodule '$name' is in $dirnow and in .git/modules/$name -- \n  we should not have two copies of this repo!");
+      if( -d "$pathnow/.git" && ! -l "$pathnow/.git" ){
+        push(@errors, "* Submodule '$c_name' is in $pathnow and in .git/modules/$c_name -- \n  we should not have two copies of this repo!");
         next;
       }
     }
     
-    if( !$force && git_tag_exists($tagdir, $tag )){
-      push(@errors, "* Tag '$tag' already exists in submodule '$name' (folder $dir)");
-      next;
+    # Check if the tag exists in the submodule. If so, it depends on user
+    # arguments whether to skip this submodule or error out
+    # If -f is given, we don't need to worry here, git tag -f will just overwrite
+    if(!$force && git_tag_exists($c_tagdir, $c_sm_tag)){
+      if(!$skip_existing && !$rename_existing){
+        push(@errors, "* Tag '$c_sm_tag' already exists in submodule '$c_name'");
+        next;
+      }
+      # Check if the existing tag in the submodule points to the same commit 
+      # that we want to tag
+      my $existing_hash = git_output(
+        "-C", $c_tagdir, "rev-parse", "refs/tags/$c_sm_tag");
+      my $sm_hash = saved_submodule_commit($c_path, $tag_hash);
+      my $equal_hash = $existing_hash eq $sm_hash;
+      # hash equal,   --skip             -> skip
+      # hash unequal  --skip             -> error
+      # hash equal,   --rename           -> rename
+      # hash unequal  --rename           -> rename
+      # hash equal,   --rename, --skip  ->  skip
+      # hash unequal  --rename, --skip  ->  rename
+      if($skip_existing && !$rename_existing){
+        if($equal_hash){
+          info("* Skipping tag '$c_sm_tag' in submodule '$c_name' - already exists with same hash '$sm_hash'");
+          next;
+        }else{
+          push(@errors, "Tag '$c_sm_tag' already exists in submodule '$c_name' with different hash '$existing_hash' than the tag in the superproject");
+          next
+        }
+      }elsif(!$skip_existing && $rename_existing){
+        # Will rename the tag below, no action needed here
+      }elsif($skip_existing && $rename_existing){
+        if($equal_hash){
+          info("* Skipping tag '$c_sm_tag' in submodule '$c_name' - already exists with same hash '$sm_hash'");
+        }else{
+          # Will rename the tag below, no action needed here
+        }
+      }else{ 
+        die("This is a bug, should never get here");
+        # because !skip && !rename is handled at loop start
+      } 
+    
+      # Rename the tag for all submodules where the original tag name exists
+      # already (--rename-existing)
+      if($rename_existing){
+        # Find an available tag name with suffix _N (N >= 2)
+        my $suf = 2;
+        while(git_tag_exists($c_path, "${c_sm_tag}_$suf")){
+          my $h = git_output("-C", $c_path, "rev-parse", "refs/tags/${c_sm_tag}_$suf");
+          if($h eq $sm_hash){ 
+            # There is already a renamed tag with our hash
+            info("* Skipping tag '$sm_tag_name' in submodule '$c_name' - already exists as '${c_sm_tag}_$suf' with same hash '$sm_hash'");
+            next TAGLOOP; # skip tagging for this submodule
+          }
+          $suf++; # try next suffix
+        }
+        $c_sm_tag = $sm_tags[$i] = "${c_sm_tag}_${suf}";
+        info("* Renaming tag '$sm_tag_name' to '$c_sm_tag' in submodule '$c_name' as it already exists");
+      }
     }
+
     # Commit that will get the tag in the submodule
-    $sm_commits{$name} = saved_submodule_commit($dir, $tag_hash);
+    $sm_commits{$c_name} = saved_submodule_commit($c_path, $tag_hash);
   }
   if (@errors){ error("Errors happened:\n", join("\n", @errors), "\n"); }
 
@@ -243,18 +325,25 @@ sub main{
     return;
   }
 
-  info("Created tag '$tag' in submodules:");
+  info("Created tag '$sm_tag_name' in submodules:");
   # for each key in sm_commits
-  for (my $i = 0; $i < @sm_names; $i++ ){
+  TAGLOOP: for (my $i = 0; $i < @sm_names; $i++ ){
     
     my $p = $sm_tagdir[$i];
     my $r = $sm_repos[$i];
     my $n = $sm_names[$i];
+    my $t = $sm_tags[$i];
     my $hash = $sm_commits{$n};
     my @tag_cmd = ("git", "-C", $p, "tag", @tag_cmd);
     # Add tag message if the given tag is annotated
     push @tag_cmd, ("-m", $tag_content) if defined $tag_content;
-    push @tag_cmd, ($tag, $hash);
+
+    # If the tag exists and and --rename-existing is set, rename it
+    # --skip-existing is already handled during the pre-check phase
+    my $disambig_tag = $t;
+    
+    
+    push @tag_cmd, ($disambig_tag, $hash);
     
     if (!$dry_run){ system(@tag_cmd); }
     

@@ -1,6 +1,6 @@
 # Main test script
 
-thisdir="$(realpath "$(dirname "${BASH_SOURCE[0]}")"
+thisdir="$(realpath "$(dirname "${BASH_SOURCE[0]}")")"
 cd "$thisdir"
 
 export GNUPGHOME=$(pwd)/gpg
@@ -24,4 +24,5 @@ rm -rf parent01
 ## Test fixture 2: Child repo absorbed within parent .git/modules
 
 bash create_repos01.sh
-git -C parent1 submodule absorbgitdirs
+git -C parent01 submodule absorbgitdirs
+bash test_submoduletag
