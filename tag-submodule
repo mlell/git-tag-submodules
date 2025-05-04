@@ -1,0 +1,460 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use File::Spec;
+use Cwd ("abs_path", "getcwd");
+use List::Util 'any';
+
+my $INFO = 1; # whether to print status output
+
+sub usage {
+  print <<EOF;
+  Usage: tag-submodule [OPTIONS] [--] tag-name [PATH...]
+  
+  OPTIONS:
+    -a      Copy tag to active submodules only. Without this option,
+            encountering a submodule that is not active will cause an error.
+    
+    -s, -u <keyid>
+            Sign tags with the default GPG key (-s) or the specified key (-u).
+            Uses the options of the same name in "git tag".
+
+    -f      Overwrite existing tags in submodules. Use "git tag -f".
+    
+    -h, --help
+            Display this usage information
+
+    -q, --quiet
+            Do not print status messages
+  
+    --      Declare end of option arguments, remaining arguments are treated
+            as positional (e.g. use if the tag name starts with dashes)
+
+  POSITIONAL ARGUMENTS:
+    tag-name
+             The tag name to use for the submodule commits
+    PATH
+             The path to the submodule directories. If not specified, the
+             current directory is used.
+   
+   EXAMPLES:
+     tag-submodule my_tag            # Copy this tag to all submodules
+     tag-submodule my_tag my_folder/ # Copy only to submodules below my_folder/
+  
+   ENVIRONMENT VARIABLES:
+     DEBUG    If set to "true" or "TRUE", print debug messages
+  
+EOF
+exit;
+}
+
+# Table of contents of functions with summary
+# 
+
+sub main{
+
+  my $commit = "HEAD"; # commit to look up submodule versions for
+  my $tag; # tag name to use for the submodule commits
+  my $sign;  # undef = don't sign, "" = git tag -s, "<keyid>" = git tag -u <keyid>
+  my $force = 0; # if =1, call git tag -f, this overwrites existing tasks
+  my $active = 0; # if =1, only copy to active submodules
+
+  while (@ARGV) {
+    my $arg = shift @ARGV;
+    if($arg eq "--"){
+      # All arguments after this are positional
+      last;
+    }
+    if($arg !~ /^-..*/){
+      # Not an option argument, treat later
+      unshift(@ARGV, $arg);
+      last;
+    }
+    if($arg eq '-h' || $arg eq '--help'){
+      usage();
+      exit 0;
+    }elsif($arg eq '-a'){
+      $active = 1;
+    }elsif($arg eq '-f'){
+      $force = 1;
+    }elsif ($arg eq '-s'){
+      $sign = "";
+    }elsif ($arg eq '-u'){
+      $sign = shift @ARGV;
+    }elsif ($arg eq '-q'){
+      $INFO = 0;
+    }else{
+      error("Unknown option: $arg, use --help");
+    };
+  }
+
+  if(! @ARGV){ error("Tag argument required, see --help") ; }
+  $tag = shift @ARGV;
+  logx("Tag: $tag");
+
+  my @paths = @ARGV;
+  
+  # Error out if we are not in a git repository
+  if(git_output("rev-parse", "--is-inside-work-tree") ne "true"){
+    error("Current directory is not in a git-managed working tree");
+  }
+
+  # Verify that the tag exists
+  if(git_status( "show-ref", "--verify", "--quiet", "refs/tags/$tag") != 0){
+    error("Tag '$tag' does not exist");
+  }
+
+  # If it is an annotated tag, save the content. Otherwise $tag_content
+  # remains undefined.
+  my $tag_content;
+  if(get_tag_type($tag) eq "annotated"){
+    $tag_content = git_output( "cat-file", "tag", "refs/tags/$tag");
+    # Remove metadata (everything above the first empty line
+    $tag_content =~ s/^.*?\n\n//s;
+    # Remove tag GPG signature (copying tag invalidates signature)
+    $tag_content =~ s/\n-----BEGIN PGP SIGNATURE-----\n.*\n-----END PGP SIGNATURE-----(\n|$)/\n/s;
+  }
+
+  # Move to the git worktree root and translate the input paths to the new 
+  # working dir
+  my $workdir = git_output("rev-parse", "--show-toplevel");
+  for( my $i = 0; $i < @paths; $i++){
+    if(! -e $paths[$i]){
+      error("Path $paths[$i] does not exist");
+    }
+    $paths[$i] = File::Spec->abs2rel($paths[$i], $workdir);
+    $paths[$i] = "" if $paths[$i] eq ".";
+  }
+  if(!@paths){
+    @paths = (".");
+  }
+  chdir $workdir;
+
+  # Error out early if the user has given an git revision that is unknown, e.g.
+  # if they gave an invalid tag or branch name with the -c option
+  if(git_status("cat-file", "-e", $commit) != 0){
+    error("Given rev '$commit' does not lead to a known commit");
+  }
+
+  # Submodule paths (inside brackets in .gitmodule) that are subdirectories 
+  # of any element in @paths
+  my @sm_paths = filter_submodule_paths(@paths);
+  
+  # Pre-check:
+  # Error if one of the submodules is not initialized or the tag already exists
+  # there
+  my @errors = ();
+  # Initialize mapping of submodule paths to submodule commits
+  my %sm_commits = ();
+  for (my $i = 0; $i < @sm_paths; $i++ ){
+    my $dir = $sm_paths[$i];
+    # Check if submodule is active
+    my $root = git_output("-C", $dir, "rev-parse", "--show-toplevel");
+    if( not is_path_same($root, $dir) ){
+      if( !$active){
+        push @errors, "* Submodule is not initialized: '$dir'";
+      }else{
+        # If -a is given: Just skip this submodule without error
+        info("Submodule '$dir' is not initialized, skipping");
+      }
+      next;
+    }
+    if( !$force && git_tag_exists($dir, $tag )){
+      push @errors, "* Tag '$tag' already exists in submodule '$dir'";
+      next;
+    }
+    # Commit that will get the tag in the submodule
+    $sm_commits{$dir} = saved_submodule_commit($dir, $commit);
+  }
+  if (@errors){ error("Errors happened:\n", join("\n", @errors), "\n"); }
+
+  # No fail, then set the tags
+  my @tag_cmd;
+  # if $sign is undefined, use -a if $tag_content is defined, else lightweight tag
+  # if $sign is "", use -s, if $sign has content, use -u
+  if(! defined $sign){
+    if(defined $tag_content){
+      push @tag_cmd, "-m", $tag_content;
+    }else{
+      # lightweight tag, no additional arguments
+    }
+  }elsif($sign eq ""){
+    push @tag_cmd, "-s";
+  }else{
+    push @tag_cmd, "-u", $sign;
+  }
+  logx("Tag command: git tag @tag_cmd");
+  
+  # end if nothing left in sm_commits, either 
+  if(! %sm_commits){
+    info("No submodules to tag in paths ", join(", ", @paths));
+    return;
+  }
+
+  info("Created tag '$tag' in submodules:");
+  # for each key in sm_commits
+  for (my $i = 0; $i < @sm_paths; $i++ ){
+    # skip if there is no key for this path, e.g. if submodule is not 
+    # active and -a is given
+    next if ! exists $sm_commits{$sm_paths[$i]};
+
+    my $p = $sm_paths[$i];
+    my $hash = $sm_commits{$p};
+    my @tag_cmd = ("git", "-C", $p, "tag");
+    # Add tag message if the given tag is annotated
+    push @tag_cmd, ("-m", $tag_content) if defined $tag_content;
+    push @tag_cmd, ($tag, $hash);
+    system(@tag_cmd);
+    
+    info("$p ($hash)");
+
+    if( $? != 0) {
+      push @errors, "* Tagging failed for submodule '$p'";
+    }
+  }
+  if (@errors){ error("Errors happened:\n", join("\n", @errors), "\n"); }
+}
+
+
+# Execute a command directly (no shell) and return the standard output
+sub readpipex {
+  no warnings 'exec';
+  open my $stdout, '-|', @_ or die "readpipex '$_[0]' failed: $!";
+  my @output = wantarray ? readline($stdout)
+    : do { local $/; scalar readline $stdout };
+  close $stdout; 
+  return wantarray ? @output : $output[0]
+}
+
+# Set the working directory to each of the given folders and execute 
+# a command
+sub execute_command_foreach{
+  # $cmd is a single string that is forwarded to a shell
+  # $super is the worktree root of the superproject
+  my ($cmd, $super, @folders) = @_;
+
+  $ENV{SUPERPROJECT}=$super;
+  my $oldwd = getcwd;
+  my @codes = ();
+  foreach (@folders){
+    chdir $_;
+    my $code = system($cmd);
+    push(@codes, $code);
+    chdir $oldwd;
+    if($code != 0){
+      print STDERR "Error $code in $_";
+    }
+  }
+  my @errors = ();
+  for( my $i = 0; $i < @codes; $i++){
+    if( $codes[$i] != 0){
+      push(@errors, "Command failed (code $codes[$i]) for $folders[$i]\n");
+    }
+  }
+  if(@errors){
+    print("$_\n") for @errors;
+    error("Command failed for some submodules");
+  }
+}
+# Function to run Git commands and capture output
+sub git_output {
+  my @command = @_;
+  logx("GIT: @command");
+  my $output = readpipex("git", @command);
+  $output =~ s/\s+$//;
+  logx("OUTPUT: $output\n");
+  return $output;
+}
+
+# Run git command and return exit code
+sub git_status {
+  my @command = @_;
+  logx("GIT: @command");
+  system("git", @command);
+  logx("STATUS: $?");
+  return $?;
+}
+
+# Return true iff the given tag exists in the given repository
+sub git_tag_exists {
+  my ($repo, $tag) = @_;
+  my $root = git_output("-C", $repo, "rev-parse", "--show-toplevel");
+  if( not is_path_same($root, $repo) ){
+    die("git_tag_exists: $repo is not a submodule")
+  }
+  git_status("-C", $repo, "show-ref", "--tags", $tag, "--quiet");
+  return not $?
+}
+
+sub list_active_submodules{
+  my $ret = git_output("config", "--get-regexp", "submodule.*active");
+  #print $ret;
+  my @list = split /\n/, $ret;
+  print for @list;
+  @list = map { /submodule\.(.*)\.active true/ } @list;
+  @list = grep { defined } @list;  # remove non-matching
+  # Remove prefix and suffix
+  @list = map { s/submodule\.(.*)\.active true/$1/; $_ } @list;
+  return @list
+}
+
+sub list_submodules {
+  my $ret = git_output("config", "-f", ".gitmodules", "--get-regexp", ".*path");
+  my @list = split /\n/, $ret;
+  @list = map { s/.*? //; $_ } @list; # Split off submodule name, leave path only
+  logx("list_submodules:");
+  logx($_) for @list;
+  logx("");
+  return @list
+}
+# List all files in the current tree and print those that are of
+# type 'commit', meaning submodules and nested repos
+sub find_nested_repositories {
+  # Use NUL characters to separate each path, to support all path characters (even
+  # newlines in file names!)
+  my $out = readpipex("bash", "-c", "git ls-tree -r -z  --format='%(objecttype) %(path)' HEAD | grep -zZ '^commit'");
+  my @paths = split(/\0/, $out);
+  # remove the "commit " string 
+  @paths = map { s/^commit //r } @paths;
+  logx("Nested repositories:");
+  logx($_) for @paths;
+  return @paths;
+}
+
+# Return submodule paths that are below any of the given paths
+# Note that the paths MUST be relative!
+sub filter_submodule_paths {
+  my @paths = @_;
+
+  # Submodule names (inside brackets in .gitmodule)
+  my @sm_paths = list_submodules();
+  # Turn into submodule paths
+  @sm_paths = uniq(@sm_paths);
+
+  # If any element of $path is "" or ".", we return all paths
+  # This saves us from keeping them in mind in the rest of the function
+  # even though its clear that these paths include all submodules
+  if(any { $_ eq "" or $_ eq "." } @paths){
+    return @sm_paths;
+  }
+
+  # Resolve duplicate path separators and ./ (does not tackle
+  # ../ components for portability)
+  @paths = map {  File::Spec->canonpath($_) } @paths;
+  @sm_paths = map {  File::Spec->canonpath($_) } @sm_paths;
+
+ 
+  # Make sure paths end with a slash to only match complete folder names
+  @paths = map { s,/*$,/,r } @paths;
+  @sm_paths = map { s,/*$,/,r } @sm_paths;
+
+  # We can't modify submodules that are not active, notify the user.
+  #my @inactive = grep { ! -e "$_/.git" } @sm_paths;
+  #@sm_paths = grep {   -e "$_/.git" } @sm_paths;
+
+  #logx("Skipping inactive submodules:\n" . join("", (map {"* $_\n"} @inactive))) if @inactive;
+  
+  # For each submodule path, check if it starts with any element of @paths 
+  @sm_paths = grep {
+    my $sm = $_;
+    logx("submodule '$sm'");
+    any {
+      my $x = index($sm, $_ ) == 0; # index 0 => starts with this
+      print("index($sm, $_) == ",$x?1:0,"\n");
+      $x
+    } @paths;
+  } @sm_paths;  
+
+  print "@sm_paths\n";
+  @sm_paths = uniq(@sm_paths);
+
+  return @sm_paths;
+}
+
+sub get_submodule_property{
+  my ($name,$prop,$configfile) = @_; 
+  $configfile //= ".git/config";
+  return git_output("config", "-f", $configfile, "--get", "submodule.$name.$prop")
+}
+
+sub saved_submodule_commit{
+  my ($path, $commitish) = @_;
+  my $output = git_output("ls-tree", $commitish, "--", $path);
+  if ( $output eq "" ){
+    error("Given object $commitish:$path is not saved in this repository")
+  }
+  my ($mode, $type, $hash, $rest) = split(/[ \t]/, $output);
+  if( $type ne "commit" ){
+    error("Given object $commitish:$path is not a submodule but a $type");
+  }
+  return $hash
+}
+
+# Given a tag name, return whether it is a "lightweight" or an
+# "annotated" tag. (Returns either of those two strings)
+sub get_tag_type{
+  my ($tag) = @_;
+  
+  # Get the object type that the tag points to
+  my $obj_type = git_output("cat-file", "-t", "refs/tags/$tag");
+  
+  # If the object is a commit, it's a lightweight tag
+  # If the object is a tag, it's an annotated tag
+  if ($obj_type eq "commit") {
+    return "lightweight";
+  } elsif ($obj_type eq "tag") {
+    return "annotated";
+  } else {
+    die("Unexpected tag object type: $obj_type");
+  }
+}
+
+sub is_subdir{
+  my ($dira, $dirb) = @_;
+  $dira = File::Spec->abs2rel($dira);
+  $dirb = File::Spec->abs2rel($dirb);
+  return(index($dira, $dirb) == 0)
+}
+
+# test if the path is the same
+sub is_path_same {
+  my ($a, $b) = @_;
+  my $same = File::Spec->rel2abs($a) eq File::Spec->rel2abs($b);
+  logx("is_path_same: $a, $b : $same");
+  return $same;
+}
+
+# Remove duplicates from a list
+sub uniq{
+  my %seen = ();
+  # $seen{$_}++: If $seen{$_} is undefined, (++) increments
+  # to 1 and returns the previous value which was undefined (=false).
+  # Then 0++ = 1 is set as $seen{$_}
+  grep { not $seen{$_}++ } @_;
+}
+
+sub logx {
+  if( defined $ENV{"DEBUG"} && $ENV{"DEBUG"} =~ /^true|TRUE$/ ){
+    my $msg = shift;
+    print("$msg\n");
+  }
+}
+
+# Error that is displayed to the user
+sub error{
+  my ($msg) = join("", @_);
+  # print to stderr
+  print STDERR "$msg\n";
+  exit 1;
+}
+
+sub info{
+  if( $INFO ){
+    my ($msg) = join("", @_);
+    print STDERR "$msg\n";
+  }
+}
+
+main;
+
