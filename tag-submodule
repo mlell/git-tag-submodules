@@ -214,7 +214,7 @@ sub main{
         $c_tagdir = $pathnow;
         $sm_tagdir[$i] = $pathnow;
       }else{
-        push(@errors, "* Submodule '$c_name' (in $pathnow) is not initialized and not in .git/modules.\n  Use git submodules update --init");
+        push(@errors, "* Submodule '$c_name' (in $c_path) is not initialized and not in .git/modules.\n  Use git submodules update --init");
         next;
       }
     }else{
@@ -511,7 +511,6 @@ sub list_submodules {
   # Get the path of each submodule from the .gitmodules file
   # (submodule name and path can be different)
   my @sm_paths = map { 
-    #git_output( "config", "-f", $temp->filename, "--get", "submodule.$_.path")
     git_config_from_commit("$commit_hash:.gitmodules", "--get", "submodule.$_.path")
   } @list;
 
