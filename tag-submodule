@@ -469,17 +469,9 @@ sub git_config_from_commit{
   my @args = @_;
 
 
-  # Read content of blob using cat-file
-  my $content = git_output("cat-file", "blob", $blob);
   
-  # output of "git config -f <(git cat-file blob <blob>) --get <args>"
-  #my $ret = qx{ git config -f <(git cat-file blob $blob) @args };
-  my ($ret, $err, $code) = cmd_communicate(["git", "config", "-f", "-", @args], $content);
-  ## Check out the config file and write it into a temporary file
-  #my $temp = File::Temp->new(UNLINK => 1);
-  #my $gitmodules = git_output("cat-file", "blob", "$blob");
-  #print $temp $gitmodules;
-  #$temp->flush;
+  my ($ret, $err, $code) = cmd_communicate(["git", "config", "--blob", $blob, @args]);
+  
   if ($code != 0 && $err eq ""){
     # Key empty
     return "";
@@ -489,7 +481,6 @@ sub git_config_from_commit{
   # Split off trailing whitespace/newline
   $ret =~ s/\s*$//s;
 
-  #my $ret = git_output("config", "-f", $temp->filename, @args);
   return $ret;
 }
 
