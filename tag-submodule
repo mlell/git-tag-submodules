@@ -498,6 +498,12 @@ sub git_config_from_commit{
 sub list_submodules {
   my $commit_hash = shift;
 
+  # Check if the given commit has .gitmodules
+  (undef, undef, my $s) = cmd_communicate(["git", "cat-file", "-e", "$commit_hash:.gitmodules"]);
+  if ($s != 0){
+    # We have no .gitmodules in this commit, therefore no submodules
+    return ([], [])
+  }
   # We need the .gitmodules content at the time of that commit
   # write it into a temporary file and give it to git config
   my $ret = git_config_from_commit(

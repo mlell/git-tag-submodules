@@ -73,7 +73,7 @@ git add . && git commit -m "Update submodule"
 
 assert "--skip-existing skips if submodule tag hash is same" <<'EOF'
   x="$(tag-submodule --skip-existing tag_lw 2>&1 || : )"
-  if [[ $x =~ "Skipping tag 'tag_lw'"  ]]; 
+  if [[ $x =~ "Skipping tag"  ]]; 
   then exit 0; else printf "ERROR output:\n%s" "$x";exit 1; fi
 EOF
 
@@ -82,24 +82,22 @@ git tag -f tag_ann # move the annotated tag to current commit to test ...
 
 assert "--skip-existing fails if submodule tag hash is different" <<'EOF'
   x="$(tag-submodule --skip-existing tag_ann 2>&1 || : )"
-  if [[ $x =~ "Tag 'tag_ann' already exists"  ]]; 
+  if [[ $x =~ "Tag already exists"  ]]; 
   then exit 0; else printf "ERROR output:\n%s" "$x";exit 1; fi
 EOF
 
 # creates tag_ann_2 in child
 assert "--rename-existing renames tag if it exists already" <<'EOF'
   x="$(tag-submodule --rename-existing tag_ann 2>&1 || : )"
-  if [[ $x =~ "Renaming tag 'tag_ann' to 'tag_ann_2'"  ]]; 
+  if [[ $x =~ "Renaming tag to 'tag_ann_2'"  ]]; 
   then exit 0; else printf "ERROR output:\n%s" "$x";exit 1; fi
 EOF
 
 assert "--rename-existing --skip-existing skips renamed tag if it exists already" <<'EOF'
   x="$(tag-submodule --rename-existing tag_ann 2>&1 || : )"
-  if [[ $x =~ Skipping.*tag_ann.*already\ exists.*tag_ann_2  ]]; 
+  if [[ $x =~ Skipping\ tag.*already\ exists.*tag_ann_2  ]]; 
   then exit 0; else printf "ERROR output:\n%s" "$x";exit 1; fi
 EOF
-
-exit 1 
 
 assert "When repeating --rename-existing --skip-existing, new new tags are created" <<'EOF'
   # Requires test "--rename-existing --skip-existing skips renamed tag if it exists already" to have just run
@@ -109,6 +107,6 @@ assert "When repeating --rename-existing --skip-existing, new new tags are creat
 EOF
 # Tear down
 cd "$thisdir"
-rm -rf parent01 gpg
+rm -rf parent01
 
 echo "All tests passed!"

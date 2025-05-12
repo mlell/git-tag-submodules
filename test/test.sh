@@ -1,4 +1,5 @@
 # Main test script
+set -e
 
 thisdir="$(realpath "$(dirname "${BASH_SOURCE[0]}")")"
 cd "$thisdir"
@@ -26,3 +27,6 @@ rm -rf parent01
 bash create_repos01.sh
 git -C parent01 submodule absorbgitdirs
 bash test_submoduletag
+rm -rf parent01
+
+rm -rf gpg
