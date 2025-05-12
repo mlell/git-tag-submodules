@@ -36,7 +36,12 @@ sub usage {
     
     --as OTHER_TAG_NAME
             Use this name for the new submodule tag instead of TAG_NAME.
-  
+    
+    --exclude EXCLUDE_PATH
+            Do not consider submodules within EXCLUDE_PATH. Sometimes this might
+            be easier than working around a certain folder by giving a lot of
+            paths in PATH. This option can be specified multiple times.
+    
     --skip-existing
             If a tag of the same name and the same hash exists already in the
             submodule, skip it. If the hash differs, throw an error, except
@@ -80,6 +85,7 @@ sub main{
   my $sm_tag_name; # --as option
   my $skip_existing = 0; # if =1, skip if tag exists with same hash
   my $rename_existing = 0; # if =1, rename existing tags with suffix _N
+  my @excluded_paths = (); # --exclude option
 
   while (@ARGV) {
     my $arg = shift @ARGV;
@@ -105,6 +111,8 @@ sub main{
       $sign = shift @ARGV;
     }elsif ($arg eq '-q'){
       $INFO = 0;
+    }elsif ($arg eq '--exclude'){
+      push(@excluded_paths, shift @ARGV);
     }elsif ($arg eq '--as'){
       $sm_tag_name = shift @ARGV;
     }elsif ($arg eq '--skip-existing'){
@@ -178,6 +186,13 @@ sub main{
 
   # Submodule paths that are subdirectories of any element in @paths
   my @keep = map { is_subdirectory_of_any($_, \@paths) } @sm_paths;
+  # ... but not subdirectories of any in @excluded_paths
+  my @exclude = map { is_subdirectory_of_any($_, \@excluded_paths) } @sm_paths;
+  for my $i (0..$#keep){
+    $keep[$i] = $keep[$i] && !$exclude[$i];
+  }
+    
+
   # get indices where return value is 1
   @keep = grep { $keep[$_] } 0..$#keep;
   @sm_paths = @sm_paths[@keep];  # submodules paths in .gitmodules
@@ -558,6 +573,10 @@ sub is_subdirectory_of_any {
   my $sm_path = $_[0];
   my @paths = @{$_[1]};
 
+  # If no paths are given, cannot be submodule of any
+  if(!@paths){
+    return 0;
+  }
 
   # If any element of $path is "" or ".", we return all paths
   # This saves us from keeping them in mind in the rest of the function
