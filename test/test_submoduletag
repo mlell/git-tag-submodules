@@ -105,8 +105,6 @@ assert "When repeating --rename-existing --skip-existing, new new tags are creat
   if [[ ! $x =~ "Renaming tag 'tag_ann'"  ]]; 
   then exit 0; else printf "ERROR output:\n%s" "$x";exit 1; fi
 EOF
-# Tear down
-cd "$thisdir"
-rm -rf parent01
+
 
 echo "All tests passed!"
